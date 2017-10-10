@@ -6,7 +6,7 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/lonnng/nano/component"
-	"github.com/lonnng/nano/message"
+	"github.com/lonnng/nano/internal/message"
 	"github.com/lonnng/nano/serialize/json"
 	"github.com/lonnng/nano/serialize/protobuf"
 	"github.com/lonnng/nano/session"
@@ -81,7 +81,7 @@ type (
 		component.Base
 	}
 
-	JsonMessage struct {
+	JSONMessage struct {
 		Code int    `json:"code"`
 		Data string `json:"data"`
 	}
@@ -95,7 +95,7 @@ func (m *ProtoMessage) Reset()         { *m = ProtoMessage{} }
 func (m *ProtoMessage) String() string { return proto.CompactTextString(m) }
 func (*ProtoMessage) ProtoMessage()    {}
 
-func (t *TestComp) HandleJson(s *session.Session, m *JsonMessage) error {
+func (t *TestComp) HandleJSON(s *session.Session, m *JSONMessage) error {
 	return nil
 }
 
@@ -103,29 +103,32 @@ func (t *TestComp) HandleProto(s *session.Session, m *ProtoMessage) error {
 	return nil
 }
 
+func (t *TestComp) RawData(s *session.Session, _ []byte) error {
+	return nil
+}
+
 func TestHandlerCallJSON(t *testing.T) {
 	SetSerializer(json.NewSerializer())
-	handler.register(&TestComp{})
+	handler.register(&TestComp{}, nil)
 
-	m := JsonMessage{Code: 1, Data: "hello world"}
+	m := JSONMessage{Code: 1, Data: "hello world"}
 	data, err := serializeOrRaw(m)
 	if err != nil {
 		t.Fail()
 	}
 
 	msg := message.New()
-	msg.Route = "TestComp.HandleJson"
+	msg.Route = "TestComp.HandleJSON"
 	msg.Type = message.Request
 	msg.Data = data
 
-	s := session.New(nil)
-
-	handler.processMessage(s, msg)
+	agent := newAgent(nil)
+	handler.processMessage(agent, msg)
 }
 
 func TestHandlerCallProtobuf(t *testing.T) {
 	SetSerializer(protobuf.NewSerializer())
-	handler.register(&TestComp{})
+	handler.register(&TestComp{}, nil)
 
 	m := &ProtoMessage{Data: proto.String("hello world")}
 	data, err := serializeOrRaw(m)
@@ -138,31 +141,30 @@ func TestHandlerCallProtobuf(t *testing.T) {
 	msg.Type = message.Request
 	msg.Data = data
 
-	s := session.New(nil)
-
-	handler.processMessage(s, msg)
+	agent := newAgent(nil)
+	handler.processMessage(agent, msg)
 }
 
 func BenchmarkHandlerCallJSON(b *testing.B) {
 	SetSerializer(json.NewSerializer())
-	handler.register(&TestComp{})
+	handler.register(&TestComp{}, nil)
 
-	m := JsonMessage{Code: 1, Data: "hello world"}
+	m := JSONMessage{Code: 1, Data: "hello world"}
 	data, err := serializeOrRaw(m)
 	if err != nil {
 		b.Fail()
 	}
 
 	msg := message.New()
-	msg.Route = "TestComp.HandleJson"
+	msg.Route = "TestComp.HandleJSON"
 	msg.Type = message.Request
 	msg.Data = data
 
-	s := session.New(nil)
+	agent := newAgent(nil)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		handler.processMessage(s, msg)
+		handler.processMessage(agent, msg)
 	}
 
 	b.ReportAllocs()
@@ -170,7 +172,7 @@ func BenchmarkHandlerCallJSON(b *testing.B) {
 
 func BenchmarkHandlerCallProtobuf(b *testing.B) {
 	SetSerializer(protobuf.NewSerializer())
-	handler.register(&TestComp{})
+	handler.register(&TestComp{}, nil)
 
 	m := &ProtoMessage{Data: proto.String("hello world")}
 	data, err := serializeOrRaw(m)
@@ -183,11 +185,35 @@ func BenchmarkHandlerCallProtobuf(b *testing.B) {
 	msg.Type = message.Request
 	msg.Data = data
 
-	s := session.New(nil)
+	agent := newAgent(nil)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		handler.processMessage(s, msg)
+		handler.processMessage(agent, msg)
+	}
+	b.ReportAllocs()
+}
+
+func BenchmarkHandlerCallRawData(b *testing.B) {
+	SetSerializer(protobuf.NewSerializer())
+	handler.register(&TestComp{}, nil)
+
+	m := &ProtoMessage{Data: proto.String("hello world")}
+	data, err := serializeOrRaw(m)
+	if err != nil {
+		b.Fail()
+	}
+
+	msg := message.New()
+	msg.Route = "TestComp.RawData"
+	msg.Type = message.Request
+	msg.Data = data
+
+	agent := newAgent(nil)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		handler.processMessage(agent, msg)
 	}
 	b.ReportAllocs()
 }

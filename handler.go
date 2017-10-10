@@ -22,19 +22,16 @@ package nano
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"reflect"
-
 	"time"
 
-	"fmt"
-
-	"github.com/lonnng/nano/codec"
 	"github.com/lonnng/nano/component"
-	"github.com/lonnng/nano/message"
-	"github.com/lonnng/nano/packet"
+	"github.com/lonnng/nano/internal/codec"
+	"github.com/lonnng/nano/internal/message"
+	"github.com/lonnng/nano/internal/packet"
 	"github.com/lonnng/nano/session"
-	"log"
 )
 
 // Unhandled message buffer size
@@ -43,11 +40,13 @@ const packetBacklog = 1024
 var (
 	// handler service singleton
 	handler = newHandlerService()
-	// handshake response data
-	hrd []byte
+
+	// serialized data
+	hrd []byte // handshake response data
+	hbd []byte // heartbeat packet data
 )
 
-func init() {
+func hbdEncode() {
 	data, err := json.Marshal(map[string]interface{}{
 		"code": 200,
 		"sys":  map[string]float64{"heartbeat": env.heartbeat.Seconds()},
@@ -60,13 +59,18 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	hbd, err = codec.Encode(packet.Heartbeat, nil)
+	if err != nil {
+		panic(err)
+	}
 }
 
 type (
 	handlerService struct {
 		services       map[string]*component.Service // all registered service
 		handlers       map[string]*component.Handler // all handler method
-		chLocalProcess chan *unhandledMessage        // packets that process locally
+		chLocalProcess chan unhandledMessage         // packets that process locally
 		chCloseSession chan *session.Session         // closed session
 	}
 
@@ -80,48 +84,75 @@ func newHandlerService() *handlerService {
 	h := &handlerService{
 		services:       make(map[string]*component.Service),
 		handlers:       make(map[string]*component.Handler),
-		chLocalProcess: make(chan *unhandledMessage, packetBacklog),
+		chLocalProcess: make(chan unhandledMessage, packetBacklog),
 		chCloseSession: make(chan *session.Session, packetBacklog),
 	}
-
-	// startup logic dispatcher
-	go h.dispatch()
 
 	return h
 }
 
 // call handler with protected
-func call(method reflect.Method, args []reflect.Value) {
+func pcall(method reflect.Method, args []reflect.Value) {
 	defer func() {
 		if err := recover(); err != nil {
-			log.Println(fmt.Sprintf("nano/dispatch: %+v", err))
+			logger.Println(fmt.Sprintf("nano/dispatch: %v", err))
+			println(stack())
 		}
 	}()
 
 	if r := method.Func.Call(args); len(r) > 0 {
 		if err := r[0].Interface(); err != nil {
-			log.Println(err.(error).Error())
+			logger.Println(err.(error).Error())
 		}
+	}
+}
+
+func onSessionClosed(s *session.Session) {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Println(fmt.Sprintf("nano/onSessionClosed: %v", err))
+			println(stack())
+		}
+	}()
+
+	env.muCallbacks.RLock()
+	defer env.muCallbacks.RUnlock()
+
+	if len(env.callbacks) < 1 {
+		return
+	}
+
+	for _, fn := range env.callbacks {
+		fn(s)
 	}
 }
 
 // dispatch message to corresponding logic handler
 func (h *handlerService) dispatch() {
-	// close chLocalProcess when application quit
-	defer close(h.chLocalProcess)
+	// close chLocalProcess & chCloseSession when application quit
+	defer func() {
+		close(h.chLocalProcess)
+		close(h.chCloseSession)
+		globalTicker.Stop()
+	}()
 
 	// handle packet that sent to chLocalProcess
 	for {
 		select {
 		case m := <-h.chLocalProcess: // logic dispatch
-			call(m.handler, m.args)
+			pcall(m.handler, m.args)
 
 		case s := <-h.chCloseSession: // session closed callback
-			transporter.RLock()
-			for _, fn := range transporter.sessionCloseCb {
-				fn(s)
-			}
-			transporter.RUnlock()
+			onSessionClosed(s)
+
+		case <-globalTicker.C: // execute cron task
+			cron()
+
+		case t := <-timerManager.chCreatedTimer: // new timers
+			timerManager.timers[t.id] = t
+
+		case id := <-timerManager.chClosingTimer: // closing timers
+			delete(timerManager.timers, id)
 
 		case <-env.die: // application quit signal
 			return
@@ -129,25 +160,21 @@ func (h *handlerService) dispatch() {
 	}
 }
 
-func (h *handlerService) register(receiver component.Component) error {
-	s := &component.Service{
-		Type:     reflect.TypeOf(receiver),
-		Receiver: reflect.ValueOf(receiver),
-	}
-	s.Name = reflect.Indirect(s.Receiver).Type().Name()
+func (h *handlerService) register(comp component.Component, opts []component.Option) error {
+	s := component.NewService(comp, opts)
 
 	if _, ok := h.services[s.Name]; ok {
 		return fmt.Errorf("handler: service already defined: %s", s.Name)
 	}
 
-	if err := s.ScanHandler(); err != nil {
+	if err := s.ExtractHandler(); err != nil {
 		return err
 	}
 
 	// register all handlers
 	h.services[s.Name] = s
-	for name, method := range s.Methods {
-		h.handlers[fmt.Sprintf("%s.%s", s.Name, name)] = method
+	for name, handler := range s.Handlers {
+		h.handlers[fmt.Sprintf("%s.%s", s.Name, name)] = handler
 	}
 	return nil
 }
@@ -155,88 +182,101 @@ func (h *handlerService) register(receiver component.Component) error {
 func (h *handlerService) handle(conn net.Conn) {
 	// create a client agent and startup write gorontine
 	agent := newAgent(conn)
+
+	// startup write goroutine
 	go agent.write()
 
-	log.Println(fmt.Sprintf("New session established: %s", agent.String()))
+	if env.debug {
+		logger.Println(fmt.Sprintf("New session established: %s", agent.String()))
+	}
+
+	// guarantee agent related resource be destroyed
+	defer func() {
+		agent.Close()
+		if env.debug {
+			logger.Println(fmt.Sprintf("Session read goroutine exit, SessionID=%d, UID=%d", agent.session.ID(), agent.session.UID()))
+		}
+	}()
 
 	// read loop
 	buf := make([]byte, 2048)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			log.Println(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
+			logger.Println(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
 			return
 		}
 
-		// TODO(warning): codec use slice for performance, packet data should be copy before next Decode
-		packets, err := agent.codec.Decode(buf[:n])
+		// TODO(warning): decoder use slice for performance, packet data should be copy before next Decode
+		packets, err := agent.decoder.Decode(buf[:n])
 		if err != nil {
-			log.Println(err.Error())
+			logger.Println(err.Error())
 			return
+		}
+
+		if len(packets) < 1 {
+			continue
 		}
 
 		// process all packet
 		for i := range packets {
-			h.processPacket(agent, packets[i])
+			if err := h.processPacket(agent, packets[i]); err != nil {
+				logger.Println(err.Error())
+				return
+			}
 		}
 	}
 }
 
-func (h *handlerService) processPacket(agent *agent, p *packet.Packet) {
+func (h *handlerService) processPacket(agent *agent, p *packet.Packet) error {
 	switch p.Type {
 	case packet.Handshake:
-		if _, err := agent.socket.Write(hrd); err != nil {
-			log.Println(err.Error())
-			agent.Close()
+		if _, err := agent.conn.Write(hrd); err != nil {
+			return err
 		}
-		log.Println(fmt.Sprintf("Session handshake Id=%d, Remote=%s", agent.session.ID, agent.socket.RemoteAddr()))
+
 		agent.setStatus(statusHandshake)
+		if env.debug {
+			logger.Println(fmt.Sprintf("Session handshake Id=%d, Remote=%s", agent.session.ID(), agent.conn.RemoteAddr()))
+		}
 
 	case packet.HandshakeAck:
-		log.Println(fmt.Sprintf("Receive handshake ACK Id=%d, Remote=%s", agent.session.ID, agent.socket.RemoteAddr()))
 		agent.setStatus(statusWorking)
+		if env.debug {
+			logger.Println(fmt.Sprintf("Receive handshake ACK Id=%d, Remote=%s", agent.session.ID(), agent.conn.RemoteAddr()))
+		}
 
 	case packet.Data:
 		if agent.status() < statusWorking {
-			log.Println(fmt.Sprintf("receive data on socket which not yet ACK, remote=%s", agent.socket.RemoteAddr().String()))
-			agent.Close()
-			return
+			return fmt.Errorf("receive data on socket which not yet ACK, session will be closed immediately, remote=%s",
+				agent.conn.RemoteAddr().String())
 		}
 
 		msg, err := message.Decode(p.Data)
 		if err != nil {
-			log.Println(err.Error())
-			return
+			return err
 		}
-		h.processMessage(agent.session, msg)
-		fallthrough
+		h.processMessage(agent, msg)
 
 	case packet.Heartbeat:
-		agent.heartbeat()
-
-	default:
-		log.Println("invalid packet type")
-		agent.Close()
-		return
+		// expected
 	}
 
 	agent.lastAt = time.Now().Unix()
+	return nil
 }
 
-func (h *handlerService) processMessage(session *session.Session, msg *message.Message) {
+func (h *handlerService) processMessage(agent *agent, msg *message.Message) {
 	switch msg.Type {
 	case message.Request:
-		session.LastRID = msg.ID
+		agent.lastMid = msg.ID
 	case message.Notify:
-		session.LastRID = 0
-	default:
-		log.Println(fmt.Sprintf("invalid message type, Type=%d", msg.Type))
-		return
+		agent.lastMid = 0
 	}
 
 	handler, ok := h.handlers[msg.Route]
 	if !ok {
-		log.Println(fmt.Sprintf("nano/handler: %s not found(forgot registered?)", msg.Route))
+		logger.Println(fmt.Sprintf("nano/handler: %s not found(forgot registered?)", msg.Route))
 		return
 	}
 
@@ -245,23 +285,24 @@ func (h *handlerService) processMessage(session *session.Session, msg *message.M
 		data = msg.Data
 	} else {
 		data = reflect.New(handler.Type.Elem()).Interface()
-		err := serializer.Deserialize(msg.Data, data)
+		err := serializer.Unmarshal(msg.Data, data)
 		if err != nil {
-			log.Println("deserialize error", err.Error())
+			logger.Println("deserialize error", err.Error())
 			return
 		}
 	}
 
 	if env.debug {
-		log.Println(fmt.Sprintf("Uid=%d, Message={%s}, Data=%+v", session.Uid, msg.String(), data))
+		logger.Println(fmt.Sprintf("UID=%d, Message={%s}, Data=%+v", agent.session.UID(), msg.String(), data))
 	}
 
-	args := []reflect.Value{handler.Receiver, reflect.ValueOf(session), reflect.ValueOf(data)}
-	h.chLocalProcess <- &unhandledMessage{handler.Method, args}
+	args := []reflect.Value{handler.Receiver, agent.srv, reflect.ValueOf(data)}
+	h.chLocalProcess <- unhandledMessage{handler.Method, args}
 }
 
-func (h *handlerService) dumpServiceMap() {
+// DumpServices outputs all registered services
+func (h *handlerService) DumpServices() {
 	for name := range h.handlers {
-		log.Println("registered service", name)
+		logger.Println("registered service", name)
 	}
 }

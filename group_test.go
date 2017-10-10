@@ -14,7 +14,7 @@ func TestChannel_Add(t *testing.T) {
 	w := make(chan bool, paraCount)
 	for i := 0; i < paraCount; i++ {
 		go func(id int) {
-			s := &session.Session{}
+			s := session.New(nil)
 			s.Bind(int64(id + 1))
 			c.Add(s)
 			w <- true
@@ -26,26 +26,16 @@ func TestChannel_Add(t *testing.T) {
 	}
 
 	if c.Count() != paraCount {
-		t.Fail()
+		t.Fatalf("count expect: %d, got: %d", paraCount, c.Count())
 	}
 
 	n := rand.Int63n(int64(paraCount) + 1)
-	if !c.IsContain(n) {
+	if !c.Contains(n) {
 		t.Fail()
 	}
 
 	// leave
-	for i := 0; i < paraCount; i++ {
-		go func(id int) {
-			c.Leave(int64(id) + 1)
-			w <- true
-		}(i)
-	}
-
-	for i := 0; i < paraCount; i++ {
-		<-w
-	}
-
+	c.LeaveAll()
 	if c.Count() != 0 {
 		t.Fail()
 	}

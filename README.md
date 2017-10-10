@@ -1,132 +1,152 @@
-# Nano -- golang based micro game server framework
+# Nano [![Build Status][1]][2] [![GoDoc][3]][4] [![Go Report Card][5]][6] [![MIT licensed][7]][8] 
 
-## Chat Room Demo
-implement a chat room in 100 lines with golang and websocket
+[1]: https://travis-ci.org/lonnng/nano.svg?branch=master
+[2]: https://travis-ci.org/lonnng/nano
+[3]: https://godoc.org/github.com/lonnng/nano?status.svg
+[4]: https://godoc.org/github.com/lonnng/nano
+[5]: https://goreportcard.com/badge/github.com/lonnng/nano
+[6]: https://goreportcard.com/report/github.com/lonnng/nano
+[7]: https://img.shields.io/badge/license-MIT-blue.svg
+[8]: LICENSE
 
-- server
+Nano is an easy to use, fast, lightweight game server networking library for Go.
+It provides a core network architecture and a series of tools and libraries that
+can help developers eliminate boring duplicate work for common underlying logic.
+The goal of nano is to improve development efficiency by eliminating the need to
+spend time on repetitious network related programming.
+
+Nano was designed for server-side applications like real-time games, social games,
+mobile games, etc of all sizes.
+
+## How to build a system with `Nano`
+
+#### What does a `Nano` application look like?
+
+The simplest "nano" application as shown in the following figure, you can make powerful applications by combining different components.
+
+![Application](./application.png)
+
+In fact, the `nano` application is a collection of  [Component ](./docs/get_started.md#component) , and a component is a bundle of  [Handler](./docs/get_started.md#handler), once you register a component to nano, nano will register all methods that can be converted to `Handler` to nano service container. Service was accessed by `Component.Handler`, and the handler will be called while client request. While handling a message, the handler will receive two arguments, session corresponding a client and a message is the payload of this request that unmarshals by nano automatically.
+
+While you had processed your logic, you can response or push message to the client by `session.Response(payload)` and `session.Push('eventName', payload)`, or returns error when some unexpected data received.
+
+#### How to build distributed system with `Nano`
+
+Nano has no built-in distributed system components, but you can easily implement it with `gRPC` and `smux` . Here we take grpc as an example.
+
+- First of all, you need to define a remote component
 ```go
-package main
+type RemoteComponent struct {
+	rpcClients []*grpc.ClientConn
+}
+```
 
-import (
-	"net/http"
-	"log"
-
-	"github.com/lonnng/nano"
-	"github.com/lonnng/nano/component"
-	"github.com/lonnng/nano/serialize/json"
-	"github.com/lonnng/nano/session"
-)
-
-
-type Room struct {
-	component.Base
-	group *nano.Group
+- Second, fetch all grpc servers infomation from services like `etcd` or `consul`  in `nano` lifetime hooks
+```go
+type ServerInfo struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
 }
 
-type UserMessage struct {
-	Name    string `json:"name"`
-	Content string `json:"content"`
-}
-
-type JoinResponse struct {
-	Code   int    `json:"code"`
-	Result string `json:"result"`
-}
-
-func NewRoom() *Room {
-	return &Room{
-		group: nano.NewGroup("room"),
+// lifetime callback
+func (r *RemoteComponent) Init() {
+	// fetch server list from etcd
+	resp, err := http.Get("http://your_etcd_server/backend/server_list/area/10023")
+	if err != nil {
+		panic(err)
+	}
+	
+	servers := []ServerInfo{}
+	if err := json.NewDecoder(resp.Body).Decode(&servers); err != nil {
+		panic(err)
+	}
+	
+	for i := range servers {
+		server := servers[i]
+		client, err := grpc.Dial(fmt.Sprintf("%s:%d", server.Host, server.Post), options)
+		if err != nil {
+			panic(err)
+		}
+		r.rpcClients = append(r.rpcClients, client)
 	}
 }
 
-func (r *Room) Join(s *session.Session, msg []byte) error {
-	s.Bind(s.ID)   // binding session uid
-	r.group.Add(s) // add session to group
-	return s.Response(JoinResponse{Result: "sucess"})
+func (r *RemoteComponent) client(s *session.Session) *grpc.ClientConn {
+	// load balance
+	return r.rpcClients[s.UID() % len(s.rpcClients)]
 }
 
-func (r *Room) Message(s *session.Session, msg *UserMessage) error {
-	return r.group.Broadcast("onMessage", msg)
-}
-
-func main() {
-	nano.Register(NewRoom())
-	nano.SetSerializer(json.NewSerializer())
-
-	log.SetFlags(log.LstdFlags | log.Llongfile)
-
-	nano.SetCheckOriginFunc(func(_ *http.Request) bool { return true })
-	nano.ListenWithOptions(":3250", true)
+// Your handler, accessed by:
+// nanoClient.Request("RemoteComponent.DemoHandler", &pb.DemoMsg{/*...*/})
+func (r *RemoteComponent) DemoHandler(s *session.Session, msg *pb.DemoMsg) error {
+	client := r.client(s)
+	// do something with client
+	// ....
+	// ...
+	return nil
 }
 ```
-  
-- client
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Chat Demo</title>
-</head>
-<body>
-<div id="container">
-    <ul>
-        <li v-for="msg in messages">[<span style="color:red;">{{msg.name}}</span>]{{msg.content}}</li>
-    </ul>
-    <div class="controls">
-        <input type="text" v-model="nickname">
-        <input type="text" v-model="inputMessage">
-        <input type="button" v-on:click="sendMessage" value="Send">
-    </div>
-</div>
-<script src="http://cdnjs.cloudflare.com/ajax/libs/vue/1.0.26/vue.min.js" type="text/javascript"></script>
-<!--[starx websocket library](https://github.com/lonnng/nano-client-websocket)-->
-<script src="protocol.js" type="text/javascript"></script>
-<script src="starx-wsclient.js" type="text/javascript"></script>
-<script>
-    var v = new Vue({
-        el: "#container",
-        data: {
-            nickname:'guest' + Date.now(),
-            inputMessage:'',
-            messages: []
-        },
-        methods: {
-            sendMessage: function () {
-                console.log(this.inputMessage);
-                starx.notify('Room.Message', {name: this.nickname, content: this.inputMessage});
-                this.inputMessage = '';
-            }
-        }
-    });
 
-    var onMessage = function (msg) {
-        v.messages.push(msg)
-    };
+The Nano will remain simple, but you can perform any operations in the component and get the desired goals. You can startup a group of `Nano` application as agent to dispatch message to backend servers.
 
-    var join = function (data) {
-        console.log(data);
-        if(data.code === 0) {
-            v.messages.push({name:'system', content:data.result});
-            starx.on('onMessage', onMessage)
-        }
-    };
+## Documents
 
-    starx.init({host: '127.0.0.1', port: 3250}, function () {
-        console.log("initialized")
-        starx.request("Room.Join", {}, join);
-    })
-</script>
-</body>
-</html>
+- English
+    + [How to build your first nano application](./docs/get_started.md)
+    + [Route compression](./docs/route_compression.md)
+    + [Communication protocol](./docs/communication_protocol.md)
+    + [Design patterns](./docs/design_patterns.md)
+    + [API Reference(Server)](https://godoc.org/github.com/lonnng/nano)
+    + [How to integrate `Lua` into `Nano` component(incomplete)](.)
+
+- 简体中文
+    + [如何构建你的第一个nano应用](./docs/get_started_zh_CN.md)
+    + [路由压缩](./docs/route_compression_zh_CN.md)
+    + [通信协议](./docs/communication_protocol_zh_CN.md)
+    + [API参考(服务器)](https://godoc.org/github.com/lonnng/nano)
+    + [如何将`lua`脚本集成到`nano`组件中(未完成)](.)
+
+## Resources
+
+- Javascript
+  + [nano-websocket-client](https://github.com/lonnng/nano-websocket-client)
+  + [nano-egret-client](https://github.com/lonnng/nano-egret-client)
+
+- Demo
+  + [Implement a chat room in 100 lines with nano and WebSocket](./examples/demo/chat)
+  + [Tadpole demo](./examples/demo/tadpole)
+
+## Community
+
+- QQGroup: [289680347](https://jq.qq.com/?_wv=1027&k=4EMMaha)
+- Reddit: [nanolabs](https://www.reddit.com/r/nanolabs/)
+
+## Successful cases
+
+- [空来血战](https://fir.im/tios)
+
+## Installation
+
+```shell
+go get github.com/lonnng/nano
+
+# dependencies
+go get -u github.com/golang/protobuf
+go get -u github.com/gorilla/websocket
 ```
 
-## The MIT License
+## Benchmark
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+```shell
+# Case:   PingPong
+# OS:     Windows 10
+# Device: i5-6500 3.2GHz 4 Core/1000-Concurrent   => IOPS 11W(Average)
+# Other:  ...
+
+cd $GOPATH/src/github.com/lonnng/nano/benchmark/io
+go test -v -tags "benchmark"
+```
+
+## License
+
+[MIT License](./LICENSE)

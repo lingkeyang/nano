@@ -4,28 +4,20 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/lonnng/nano/benchmark/testdata"
 )
 
-type Message struct {
-	Data *string `protobuf:"bytes,1,name=data"`
-}
-
-func (m *Message) Reset()         { *m = Message{} }
-func (m *Message) String() string { return proto.CompactTextString(m) }
-func (*Message) ProtoMessage()    {}
-
 func TestProtobufSerialezer_Serialize(t *testing.T) {
-	m := &Message{proto.String("hello")}
+	m := &testdata.Ping{Content: "hello"}
 	s := NewSerializer()
 
-	b, err := s.Serialize(m)
+	b, err := s.Marshal(m)
 	if err != nil {
 		t.Error(err)
 	}
 
-	m1 := &Message{}
-	s.Deserialize(b, m1)
+	m1 := &testdata.Ping{}
+	s.Unmarshal(b, m1)
 
 	if !reflect.DeepEqual(m, m1) {
 		t.Fail()
@@ -33,27 +25,27 @@ func TestProtobufSerialezer_Serialize(t *testing.T) {
 }
 
 func BenchmarkSerializer_Serialize(b *testing.B) {
-	m := &Message{proto.String("hello")}
+	m := &testdata.Ping{Content: "hello"}
 	s := NewSerializer()
 
-	for i := 0; i < b.N; i++ {
-		s.Serialize(m)
-	}
-
 	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		s.Marshal(m)
+	}
 }
 
 func BenchmarkSerializer_Deserialize(b *testing.B) {
-	m := &Message{proto.String("hello")}
+	m := &testdata.Ping{Content: "hello"}
 	s := NewSerializer()
 
-	d, err := s.Serialize(m)
+	d, err := s.Marshal(m)
 	if err != nil {
 		b.Error(err)
 	}
 
-	for i := 0; i<b.N; i++ {
-		m1 := &Message{}
-		s.Deserialize(d, m1)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		m1 := &testdata.Ping{}
+		s.Unmarshal(d, m1)
 	}
 }

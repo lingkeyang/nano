@@ -30,7 +30,7 @@
         methods: {
             sendMessage: function () {
                 console.log(this.inputMessage);
-                starx.notify('Room.Message', {name: this.nickname, content: this.inputMessage});
+                starx.notify('room.message', {name: this.nickname, content: this.inputMessage});
                 this.inputMessage = '';
             }
         }
@@ -48,9 +48,21 @@
         }
     };
 
+    var onNewUser = function (data) {
+        console.log(data);
+        v.messages.push({name:'system', content:data.content});
+    };
+
+    var onMembers = function (data) {
+        console.log(data);
+        v.messages.push({name:'system', content: "members: "+data.members});
+    };
+
     starx.init({host: '127.0.0.1', port: 3250}, function () {
-        console.log("initialized")
-        starx.request("Room.Join", {}, join);
+        console.log("initialized");
+        starx.on("onNewUser", onNewUser);
+        starx.on("onMembers", onMembers);
+        starx.request("room.join", {}, join);
     })
 </script>
 </body>

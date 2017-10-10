@@ -24,59 +24,171 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"sync/atomic"
 	"time"
 
-	"github.com/lonnng/nano/codec"
-	"github.com/lonnng/nano/message"
-	"github.com/lonnng/nano/packet"
+	"github.com/lonnng/nano/internal/codec"
+	"github.com/lonnng/nano/internal/message"
+	"github.com/lonnng/nano/internal/packet"
 	"github.com/lonnng/nano/session"
-	"log"
 )
 
-const agentWriteBacklog = 16
+const (
+	agentWriteBacklog = 16
+)
 
 var (
-	ErrBrokenPipe   = errors.New("broken low-level pipe")
+	// ErrBrokenPipe represents the low-level connection has broken.
+	ErrBrokenPipe = errors.New("broken low-level pipe")
+	// ErrBufferExceed indicates that the current session buffer is full and
+	// can not receive more data.
 	ErrBufferExceed = errors.New("session send buffer exceed")
 )
 
-// Agent corresponding a user, used for store raw socket information
 type (
+	// Agent corresponding a user, used for store raw conn information
 	agent struct {
-		lastAt  int64               // last heartbeat unix time stamp
-		socket  net.Conn            // low-level socket fd
-		chSend  chan pendingMessage // push message queue
+		// regular agent member
+		session *session.Session    // session
+		conn    net.Conn            // low-level conn fd
+		lastMid uint                // last message id
 		state   int32               // current agent state
 		chDie   chan struct{}       // wait for close
-		codec   *codec.Decoder      // coder & decoder
-		session *session.Session    // session
+		chSend  chan pendingMessage // push message queue
+		lastAt  int64               // last heartbeat unix time stamp
+		decoder *codec.Decoder      // binary decoder
+
+		srv reflect.Value // cached session reflect.Value
 	}
 
 	pendingMessage struct {
-		typ     message.MessageType // message type
-		route   string              // message route(push)
-		mid     uint                // response message id(response)
-		payload interface{}         // payload
+		typ     message.Type // message type
+		route   string       // message route(push)
+		mid     uint         // response message id(response)
+		payload interface{}  // payload
 	}
 )
 
 // Create new agent instance
 func newAgent(conn net.Conn) *agent {
 	a := &agent{
-		socket: conn,
-		lastAt: time.Now().Unix(),
-		chSend: make(chan pendingMessage, agentWriteBacklog),
-		state:  statusStart,
-		chDie:  make(chan struct{}),
-		codec:  codec.NewDecoder(),
+		conn:    conn,
+		state:   statusStart,
+		chDie:   make(chan struct{}),
+		lastAt:  time.Now().Unix(),
+		chSend:  make(chan pendingMessage, agentWriteBacklog),
+		decoder: codec.NewDecoder(),
 	}
 
 	// binding session
 	s := session.New(a)
 	a.session = s
+	a.srv = reflect.ValueOf(s)
 
 	return a
+}
+
+func (a *agent) MID() uint {
+	return a.lastMid
+}
+
+// Push, implementation for session.NetworkEntity interface
+func (a *agent) Push(route string, v interface{}) error {
+	if a.status() == statusClosed {
+		return ErrBrokenPipe
+	}
+
+	if len(a.chSend) >= agentWriteBacklog {
+		return ErrBufferExceed
+	}
+
+	if env.debug {
+		switch d := v.(type) {
+		case []byte:
+			logger.Println(fmt.Sprintf("Type=Push, ID=%d, UID=%d, Route=%s, Data=%dbytes",
+				a.session.ID(), a.session.UID(), route, len(d)))
+		default:
+			logger.Println(fmt.Sprintf("Type=Push, ID=%d, UID=%d, Route=%s, Data=%+v",
+				a.session.ID(), a.session.UID(), route, v))
+		}
+	}
+
+	a.chSend <- pendingMessage{typ: message.Push, route: route, payload: v}
+	return nil
+}
+
+// Response, implementation for session.NetworkEntity interface
+// Response message to session
+func (a *agent) Response(v interface{}) error {
+	return a.ResponseMID(a.session.MID(), v)
+}
+
+// Response, implementation for session.NetworkEntity interface
+// Response message to session
+func (a *agent) ResponseMID(mid uint, v interface{}) error {
+	if a.status() == statusClosed {
+		return ErrBrokenPipe
+	}
+
+	if mid <= 0 {
+		return ErrSessionOnNotify
+	}
+
+	if len(a.chSend) >= agentWriteBacklog {
+		return ErrBufferExceed
+	}
+
+	if env.debug {
+		switch d := v.(type) {
+		case []byte:
+			logger.Println(fmt.Sprintf("Type=Response, ID=%d, UID=%d, MID=%d, Data=%dbytes",
+				a.session.ID(), a.session.UID(), mid, len(d)))
+		default:
+			logger.Println(fmt.Sprintf("Type=Response, ID=%d, UID=%d, MID=%d, Data=%+v",
+				a.session.ID(), a.session.UID(), mid, v))
+		}
+	}
+
+	a.chSend <- pendingMessage{typ: message.Response, mid: mid, payload: v}
+	return nil
+}
+
+// Close, implementation for session.NetworkEntity interface
+// Close closes the agent, clean inner state and close low-level connection.
+// Any blocked Read or Write operations will be unblocked and return errors.
+func (a *agent) Close() error {
+	if a.status() == statusClosed {
+		return ErrCloseClosedSession
+	}
+	a.setStatus(statusClosed)
+
+	if env.debug {
+		logger.Println(fmt.Sprintf("Session closed, ID=%d, UID=%d, IP=%s",
+			a.session.ID(), a.session.UID(), a.conn.RemoteAddr()))
+	}
+
+	// prevent closing closed channel
+	select {
+	case <-a.chDie:
+		// expect
+	default:
+		close(a.chDie)
+		handler.chCloseSession <- a.session
+	}
+
+	return a.conn.Close()
+}
+
+// RemoteAddr, implementation for session.NetworkEntity interface
+// returns the remote network address.
+func (a *agent) RemoteAddr() net.Addr {
+	return a.conn.RemoteAddr()
+}
+
+// String, implementation for Stringer interface
+func (a *agent) String() string {
+	return fmt.Sprintf("Remote=%s, LastTime=%d", a.conn.RemoteAddr().String(), a.lastAt)
 }
 
 func (a *agent) status() int32 {
@@ -95,6 +207,10 @@ func (a *agent) write() {
 		ticker.Stop()
 		close(a.chSend)
 		close(chWrite)
+		a.Close()
+		if env.debug {
+			logger.Println(fmt.Sprintf("Session write goroutine exit, SessionID=%d, UID=%d", a.session.ID(), a.session.UID()))
+		}
 	}()
 
 	for {
@@ -102,24 +218,22 @@ func (a *agent) write() {
 		case <-ticker.C:
 			deadline := time.Now().Add(-2 * env.heartbeat).Unix()
 			if a.lastAt < deadline {
-				log.Println(fmt.Sprintf("Session heartbeat timeout, LastTime=%d, Deadline=%d", a.lastAt, deadline))
-				a.socket.Close()
+				logger.Println(fmt.Sprintf("Session heartbeat timeout, LastTime=%d, Deadline=%d", a.lastAt, deadline))
 				return
 			}
-			chWrite <- heartbeatPacket
+			chWrite <- hbd
 
 		case data := <-chWrite:
-			// close agent while low-level socket broken
-			if _, err := a.socket.Write(data); err != nil {
-				log.Println(err.Error())
-				a.socket.Close()
+			// close agent while low-level conn broken
+			if _, err := a.conn.Write(data); err != nil {
+				logger.Println(err.Error())
 				return
 			}
 
 		case data := <-a.chSend:
 			payload, err := serializeOrRaw(data.payload)
 			if err != nil {
-				log.Println(err.Error())
+				logger.Println(err.Error())
 				break
 			}
 
@@ -132,70 +246,23 @@ func (a *agent) write() {
 			}
 			em, err := m.Encode()
 			if err != nil {
-				log.Println(err.Error())
+				logger.Println(err.Error())
 				break
 			}
 
 			// packet encode
 			p, err := codec.Encode(packet.Data, em)
 			if err != nil {
-				log.Println(err)
+				logger.Println(err)
 				break
 			}
 			chWrite <- p
 
 		case <-a.chDie: // agent closed signal
 			return
+
+		case <-env.die: // application quit
+			return
 		}
 	}
-}
-
-// String, implementation for Stringer interface
-func (a *agent) String() string {
-	return fmt.Sprintf("Remote=%s, LastTime=%d", a.socket.RemoteAddr().String(), a.lastAt)
-}
-
-func (a *agent) heartbeat() {
-	a.lastAt = time.Now().Unix()
-}
-
-func (a *agent) Close() {
-	if a.state == statusClosed {
-		return
-	}
-
-	a.state = statusClosed
-	log.Println(fmt.Sprintf("Session closed, Id=%d, IP=%s", a.session.ID, a.socket.RemoteAddr()))
-
-	// close all channel
-	close(a.chDie)
-	a.socket.Close()
-}
-
-func (a *agent) Push(route string, v interface{}) error {
-	if a.status() == statusClosed {
-		return ErrBrokenPipe
-	}
-
-	if len(a.chSend) >= agentWriteBacklog {
-		return ErrBufferExceed
-	}
-
-	a.chSend <- pendingMessage{typ: message.Push, route: route, payload: v}
-	return nil
-}
-
-// Response message to session
-func (a *agent) Response(v interface{}) error {
-	mid := a.session.LastRID
-	if mid <= 0 {
-		return ErrSessionOnNotify
-	}
-
-	if len(a.chSend) >= agentWriteBacklog {
-		return ErrBufferExceed
-	}
-
-	a.chSend <- pendingMessage{typ: message.Response, mid: mid, payload: v}
-	return nil
 }

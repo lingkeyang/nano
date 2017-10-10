@@ -23,12 +23,15 @@ package nano
 import (
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/lonnng/nano/session"
 )
 
+// VERSION returns current nano version
 var VERSION = "0.0.1"
 
 var (
@@ -46,13 +49,23 @@ var (
 		heartbeat   time.Duration            // heartbeat internal
 		checkOrigin func(*http.Request) bool // check origin when websocket enabled
 		debug       bool                     // enable debug
+
+		// session closed handlers
+		muCallbacks sync.RWMutex           // protect callbacks
+		callbacks   []SessionClosedHandler // callbacks that emitted on session closed
 	}{}
+)
+
+type (
+	// SessionClosedHandler represents a callback that will be called when a session
+	// close or session low-level connection broken.
+	SessionClosedHandler func(session *session.Session)
 )
 
 // init default configs
 func init() {
 	// application initialize
-	app.name = strings.TrimLeft(path.Base(os.Args[0]), "/")
+	app.name = strings.TrimLeft(filepath.Base(os.Args[0]), "/")
 	app.startAt = time.Now()
 
 	// environment initialize
@@ -64,4 +77,7 @@ func init() {
 
 	env.die = make(chan bool)
 	env.heartbeat = 30 * time.Second
+	env.debug = false
+	env.muCallbacks = sync.RWMutex{}
+	env.checkOrigin = func(_ *http.Request) bool { return true }
 }

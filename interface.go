@@ -22,52 +22,33 @@ package nano
 
 import (
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/lonnng/nano/component"
-	"log"
+	"github.com/lonnng/nano/internal/message"
 )
 
-// ListenWithOptions start a starx application
-func ListenWithOptions(addr string, isWs bool) {
-	startupComps()
-
-	go func() {
-		if isWs {
-			listenAndServeWS(addr)
-		} else {
-			listenAndServe(addr)
-		}
-	}()
-
-	log.Println("listen at", addr)
-	sg := make(chan os.Signal)
-	signal.Notify(sg, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGKILL)
-
-	// stop server
-	select {
-	case <-env.die:
-		log.Println("The app will shutdown in a few seconds")
-	case s := <-sg:
-		log.Println("got signal", s)
-	}
-
-	log.Println("server is stopping...")
-
-	// shutdown all components registered by application, that
-	// call by reverse order against register
-	shutdownComps()
+// Listen listens on the TCP network address addr
+// and then calls Serve with handler to handle requests
+// on incoming connections.
+func Listen(addr string) {
+	listen(addr, false)
 }
 
-func Register(c component.Component) {
-	comps = append(comps, c)
+// ListenWS listens on the TCP network address addr
+// and then upgrades the HTTP server connection to the WebSocket protocol
+// to handle requests on incoming connections.
+func ListenWS(addr string) {
+	listen(addr, true)
 }
 
-// Set heartbeat time internal
-func SetHeartbeatInternal(d time.Duration) {
+// Register register a component with options
+func Register(c component.Component, options ...component.Option) {
+	comps = append(comps, regComp{c, options})
+}
+
+// SetHeartbeatInterval set heartbeat time interval
+func SetHeartbeatInterval(d time.Duration) {
 	env.heartbeat = d
 }
 
@@ -76,10 +57,26 @@ func SetCheckOriginFunc(fn func(*http.Request) bool) {
 	env.checkOrigin = fn
 }
 
+// Shutdown send a signal to let 'nano' shutdown itself.
 func Shutdown() {
 	close(env.die)
 }
 
+// EnableDebug let 'nano' to run under debug mode.
 func EnableDebug() {
 	env.debug = true
+}
+
+// OnSessionClosed set the Callback which will be called when session is closed
+// Waring: session has closed,
+func OnSessionClosed(cb SessionClosedHandler) {
+	env.muCallbacks.Lock()
+	defer env.muCallbacks.Unlock()
+
+	env.callbacks = append(env.callbacks, cb)
+}
+
+// SetDictionary set routes map, TODO(warning): set dictionary in runtime would be a dangerous operation!!!!!!
+func SetDictionary(dict map[string]uint16) {
+	message.SetDictionary(dict)
 }

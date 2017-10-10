@@ -21,12 +21,11 @@
 package nano
 
 import (
-	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"github.com/lonnng/nano/session"
-	"log"
 )
 
 const (
@@ -34,47 +33,56 @@ const (
 	groupStatusClosed  = 1
 )
 
+// SessionFilter represents a filter which was used to filter session when Multicast,
+// the session will receive the message while filter returns true.
 type SessionFilter func(*session.Session) bool
-
-var (
-	ErrCloseClosedGroup = errors.New("close closed group")
-	ErrClosedGroup      = errors.New("group closed")
-	ErrMemberNotFound   = errors.New("member not found in the group")
-)
 
 // Group represents a session group which used to manage a number of
 // sessions, data send to the group will send to all session in it.
 type Group struct {
-	sync.RWMutex
-	status  int32
-	name    string                     // channel name
-	uids    map[int64]*session.Session // uid map to session pointer
-	members []int64                    // all user ids
+	mu       sync.RWMutex
+	status   int32                      // channel current status
+	name     string                     // channel name
+	sessions map[int64]*session.Session // session id map to session instance
 }
 
+// NewGroup returns a new group instance
 func NewGroup(n string) *Group {
 	return &Group{
-		status: groupStatusWorking,
-		name:   n,
-		uids:   make(map[int64]*session.Session),
+		status:   groupStatusWorking,
+		name:     n,
+		sessions: make(map[int64]*session.Session),
 	}
 }
 
-func (c *Group) Member(uid int64) *session.Session {
-	c.RLock()
-	defer c.RUnlock()
+// Member returns specified UID's session
+func (c *Group) Member(uid int64) (*session.Session, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-	return c.uids[uid]
+	for _, s := range c.sessions {
+		if s.UID() == uid {
+			return s, nil
+		}
+	}
+
+	return nil, ErrMemberNotFound
 }
 
+// Members returns all member's UID in current group
 func (c *Group) Members() []int64 {
-	c.RLock()
-	defer c.RUnlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-	return c.members
+	members := []int64{}
+	for _, s := range c.sessions {
+		members = append(members, s.UID())
+	}
+
+	return members
 }
 
-// Push message to partial client, which filter return true
+// Multicast  push  the message to the filtered clients
 func (c *Group) Multicast(route string, v interface{}, filter SessionFilter) error {
 	if c.isClosed() {
 		return ErrClosedGroup
@@ -85,23 +93,26 @@ func (c *Group) Multicast(route string, v interface{}, filter SessionFilter) err
 		return err
 	}
 
-	c.RLock()
-	defer c.RUnlock()
+	if env.debug {
+		logger.Println(fmt.Sprintf("Type=Multicast Route=%s, Data=%+v", route, v))
+	}
 
-	for _, s := range c.uids {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, s := range c.sessions {
 		if !filter(s) {
 			continue
 		}
-		err = s.Push(route, data)
-		if err != nil {
-			log.Println(err.Error())
+		if err = s.Push(route, data); err != nil {
+			logger.Println(err.Error())
 		}
 	}
 
 	return nil
 }
 
-// Push message to all client
+// Broadcast push  the message(s) to  all members
 func (c *Group) Broadcast(route string, v interface{}) error {
 	if c.isClosed() {
 		return ErrClosedGroup
@@ -112,89 +123,87 @@ func (c *Group) Broadcast(route string, v interface{}) error {
 		return err
 	}
 
-	c.RLock()
-	defer c.RUnlock()
+	if env.debug {
+		logger.Println(fmt.Sprintf("Type=Broadcast Route=%s, Data=%+v", route, v))
+	}
 
-	for _, s := range c.uids {
-		err = s.Push(route, data)
-		if err != nil {
-			log.Println(err.Error())
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, s := range c.sessions {
+		if err = s.Push(route, data); err != nil {
+			logger.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
 		}
 	}
 
 	return err
 }
 
-func (c *Group) IsContain(uid int64) bool {
-	c.RLock()
-	defer c.RUnlock()
-
-	if _, ok := c.uids[uid]; ok {
-		return true
-	}
-
-	return false
+// Contains check whether a UID is contained in current group or not
+func (c *Group) Contains(uid int64) bool {
+	_, err := c.Member(uid)
+	return err == nil
 }
 
+// Add add session to group
 func (c *Group) Add(session *session.Session) error {
 	if c.isClosed() {
 		return ErrClosedGroup
 	}
 
-	c.Lock()
-	defer c.Unlock()
+	if env.debug {
+		logger.Println(fmt.Sprintf("Add session to group %s, ID=%d, UID=%d", c.name, session.ID(), session.UID()))
+	}
 
-	c.uids[session.Uid] = session
-	c.members = append(c.members, session.Uid)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	id := session.ID()
+	_, ok := c.sessions[session.ID()]
+	if ok {
+		return ErrSessionDuplication
+	}
+
+	c.sessions[id] = session
 	return nil
 }
 
-func (c *Group) Leave(uid int64) error {
+// Leave remove specified UID related session from group
+func (c *Group) Leave(s *session.Session) error {
 	if c.isClosed() {
 		return ErrClosedGroup
 	}
 
-	if !c.IsContain(uid) {
-		return ErrMemberNotFound
+	if env.debug {
+		logger.Println(fmt.Sprintf("Remove session from group %s, UID=%d", c.name, s.UID()))
 	}
 
-	c.Lock()
-	defer c.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	var temp []int64
-	for i, u := range c.members {
-		if u == uid {
-			temp = append(temp, c.members[:i]...)
-			c.members = append(temp, c.members[(i+1):]...)
-			break
-		}
-	}
-	delete(c.uids, uid)
-
+	delete(c.sessions, s.ID())
 	return nil
 }
 
+// LeaveAll clear all sessions in the group
 func (c *Group) LeaveAll() error {
-	if atomic.LoadInt32(&c.status) == groupStatusClosed {
+	if c.isClosed() {
 		return ErrClosedGroup
 	}
 
-	c.Lock()
-	defer c.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	c.uids = make(map[int64]*session.Session)
-	c.members = make([]int64, 0)
-
+	c.sessions = make(map[int64]*session.Session)
 	return nil
 }
 
 // Count get current member amount in the group
 func (c *Group) Count() int {
-	c.RLock()
-	defer c.RUnlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-	return len(c.uids)
+	return len(c.sessions)
 }
 
 func (c *Group) isClosed() bool {
@@ -213,8 +222,6 @@ func (c *Group) Close() error {
 	atomic.StoreInt32(&c.status, groupStatusClosed)
 
 	// release all reference
-	c.uids = make(map[int64]*session.Session)
-	c.members = []int64{}
-
+	c.sessions = make(map[int64]*session.Session)
 	return nil
 }

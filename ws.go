@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"log"
 )
 
 // wsConn is an adapter to t.Conn, which implements all t.Conn
@@ -140,7 +139,7 @@ func (c *wsConn) SetWriteDeadline(t time.Time) error {
 func (h *handlerService) handleWS(conn *websocket.Conn) {
 	c, err := newWSConn(conn)
 	if err != nil {
-		log.Println(err)
+		logger.Println(err)
 		return
 	}
 	h.handle(c)
